@@ -15,7 +15,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-MODEL_PATH = Path("project_regression_model.joblib")  # name used in the notebook's last cell
+# Look next to this script (not the folder streamlit was launched from).
+APP_DIR = Path(__file__).resolve().parent
+MODEL_NAME = "streamlit_app.joblib"  # your saved model file
 
 # Same engineered features as the notebook (cell 3).
 ROLL_COLS = ["recovery_score", "sleep_quality", "fatigue_index", "training_load"]
@@ -29,14 +31,38 @@ def load_model(path):
     return joblib.load(path)
 
 
-if not MODEL_PATH.exists():
-    st.error(
-        f"Model file `{MODEL_PATH}` not found. Put the file saved by the notebook "
-        "next to this script."
-    )
-    st.stop()
+@st.cache_resource
+def load_uploaded_model(data: bytes):
+    import io
+    return joblib.load(io.BytesIO(data))
 
-model = load_model(MODEL_PATH)
+
+def find_model_file():
+    """Exact name first, then any .joblib next to the script or in the launch folder."""
+    for folder in (APP_DIR, Path.cwd()):
+        exact = folder / MODEL_NAME
+        if exact.exists():
+            return exact
+    for folder in (APP_DIR, Path.cwd()):
+        found = sorted(folder.glob("*.joblib"))
+        if found:
+            return found[0]
+    return None
+
+
+model_path = find_model_file()
+if model_path is not None:
+    model = load_model(str(model_path))
+    st.sidebar.caption(f"Model: `{model_path.name}`")
+else:
+    st.warning(
+        f"No `.joblib` model found in `{APP_DIR}`. Upload the file saved by the "
+        f"notebook (`{MODEL_NAME}`), or copy it into that folder and rerun."
+    )
+    uploaded = st.file_uploader("Model file (.joblib)", type="joblib")
+    if uploaded is None:
+        st.stop()
+    model = load_uploaded_model(uploaded.getvalue())
 prep = model.named_steps["prep"]
 
 # Column lists exactly as the ColumnTransformer was fitted.

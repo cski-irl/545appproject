@@ -1,83 +1,109 @@
 """
 Streamlit app for the next-session injury-risk model from 545_Model__Project_.ipynb.
 
-The saved file is the full sklearn Pipeline (preprocessing + tuned RandomForest),
-so it takes a DataFrame with the raw feature columns and does its own
-imputation, scaling and one-hot encoding.
+The model is the notebook's tuned pipeline (median imputation + scaling for numeric
+columns, most-frequent imputation + one-hot for categorical columns, then a
+200-tree RandomForest), exported to `model_export.npz` as plain NumPy arrays.
+Predictions are computed here with NumPy, so the app does not depend on any
+particular scikit-learn or Python version.
 
 Run:  streamlit run streamlit_app.py
 """
 
+import json
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Look next to this script (not the folder streamlit was launched from).
 APP_DIR = Path(__file__).resolve().parent
-MODEL_NAME = "streamlit_app.joblib"  # your saved model file
+MODEL_FILE = APP_DIR / "model_export.npz"
 
 # Same engineered features as the notebook (cell 3).
 ROLL_COLS = ["recovery_score", "sleep_quality", "fatigue_index", "training_load"]
 
 
 # --------------------------------------------------------------------------------------
-# Load model and read everything we need back out of the fitted pipeline
+# Model: NumPy re-implementation of the fitted sklearn pipeline
 # --------------------------------------------------------------------------------------
+class InjuryRiskModel:
+    def __init__(self, path):
+        d = np.load(path, allow_pickle=False)
+        meta = json.loads(str(d["meta"]))
+        self.numeric_features = meta["numeric_features"]
+        self.categorical_features = meta["categorical_features"]
+        self.categories = meta["categories"]
+        self.cat_fill = meta["cat_fill"]
+        self.medians, self.mean, self.scale = d["medians"], d["mean"], d["scale"]
+        self.offsets = d["offsets"]
+        self.left, self.right = d["left"], d["right"]
+        self.feature, self.threshold = d["feature"], d["threshold"]
+        self.leaf_proba = d["proba"]
+
+    @property
+    def features(self):
+        return self.numeric_features + self.categorical_features
+
+    def _transform(self, df):
+        # Numeric: median-impute, then standard-scale.
+        Xn = df[self.numeric_features].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+        Xn = np.where(np.isnan(Xn), self.medians, Xn)
+        Xn = (Xn - self.mean) / self.scale
+        # Categorical: most-frequent impute, then one-hot (unknown values -> all zeros).
+        blocks = [Xn]
+        for col, cats, fill in zip(self.categorical_features, self.categories, self.cat_fill):
+            vals = df[col].where(df[col].notna(), fill).tolist()
+            oh = np.zeros((len(df), len(cats)))
+            for i, v in enumerate(vals):
+                for j, c in enumerate(cats):
+                    if v == c or str(v) == str(c):
+                        oh[i, j] = 1.0
+                        break
+            blocks.append(oh)
+        # sklearn trees compare in float32.
+        return np.hstack(blocks).astype(np.float32)
+
+    def predict_proba(self, df):
+        X = self._transform(df)
+        n = len(X)
+        total = np.zeros((n, 2))
+        rows = np.arange(n)
+        for t in range(len(self.offsets) - 1):
+            base = self.offsets[t]
+            node = np.zeros(n, dtype=np.int64)
+            while True:
+                g = base + node
+                is_split = self.left[g] != -1
+                if not is_split.any():
+                    break
+                f = self.feature[g]
+                go_left = X[rows, np.where(is_split, f, 0)] <= self.threshold[g].astype(np.float32)
+                nxt = np.where(go_left, self.left[g], self.right[g])
+                node = np.where(is_split, nxt, node)
+            total += self.leaf_proba[base + node]
+        return total / (len(self.offsets) - 1)
+
+    def predict(self, df):
+        return (self.predict_proba(df)[:, 1] > 0.5).astype(int)
+
+
 @st.cache_resource
 def load_model(path):
-    return joblib.load(path)
+    return InjuryRiskModel(path)
 
 
-@st.cache_resource
-def load_uploaded_model(data: bytes):
-    import io
-    return joblib.load(io.BytesIO(data))
+if not MODEL_FILE.exists():
+    st.error(f"`{MODEL_FILE.name}` not found. Put it in the same folder as this script.")
+    st.stop()
 
-
-def find_model_file():
-    """Exact name first, then any .joblib next to the script or in the launch folder."""
-    for folder in (APP_DIR, Path.cwd()):
-        exact = folder / MODEL_NAME
-        if exact.exists():
-            return exact
-    for folder in (APP_DIR, Path.cwd()):
-        found = sorted(folder.glob("*.joblib"))
-        if found:
-            return found[0]
-    return None
-
-
-model_path = find_model_file()
-if model_path is not None:
-    model = load_model(str(model_path))
-    st.sidebar.caption(f"Model: `{model_path.name}`")
-else:
-    st.warning(
-        f"No `.joblib` model found in `{APP_DIR}`. Upload the file saved by the "
-        f"notebook (`{MODEL_NAME}`), or copy it into that folder and rerun."
-    )
-    uploaded = st.file_uploader("Model file (.joblib)", type="joblib")
-    if uploaded is None:
-        st.stop()
-    model = load_uploaded_model(uploaded.getvalue())
-prep = model.named_steps["prep"]
-
-# Column lists exactly as the ColumnTransformer was fitted.
-numeric_features = list(prep.transformers_[0][2])
-categorical_features = list(prep.transformers_[1][2])
-FEATURES = numeric_features + categorical_features
-
-# Training medians (from the imputer) make sensible defaults; scaler std gives step sizes.
-num_pipe = prep.named_transformers_["num"]
-medians = dict(zip(numeric_features, num_pipe.named_steps["impute"].statistics_))
-stds = dict(zip(numeric_features, num_pipe.named_steps["scale"].scale_))
-
-# Category options the encoder saw during training.
-onehot = prep.named_transformers_["cat"].named_steps["onehot"]
-cat_options = {c: list(cats) for c, cats in zip(categorical_features, onehot.categories_)}
+model = load_model(str(MODEL_FILE))
+numeric_features = model.numeric_features
+categorical_features = model.categorical_features
+FEATURES = model.features
+medians = dict(zip(numeric_features, model.medians))
+stds = dict(zip(numeric_features, model.scale))
+cat_options = dict(zip(categorical_features, model.categories))
 
 base_numeric = [c for c in numeric_features if not c.endswith(("_roll5", "_trend3"))]
 INT_COLS = {"step_count", "age"}
@@ -100,8 +126,8 @@ def add_history_features(hist):
 
 
 def show_prediction(row):
-    proba = float(model.predict_proba(row[FEATURES])[:, 1][0])
-    pred = int(model.predict(row[FEATURES])[0])
+    proba = float(model.predict_proba(row[FEATURES])[0, 1])
+    pred = int(proba > 0.5)
     st.subheader("Prediction for the next session")
     c1, c2 = st.columns(2)
     c1.metric("Probability of high-risk next session", f"{proba:.1%}")
@@ -175,8 +201,6 @@ if mode.startswith("Enter"):
                 values[t] = 0.0
 
     row = pd.DataFrame([values])
-    for c in numeric_features:
-        row[c] = row[c].astype(float)
     show_prediction(row)
 
 # ---- Mode 2: CSV history -------------------------------------------------------------
